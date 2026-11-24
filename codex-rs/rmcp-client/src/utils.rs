@@ -17,15 +17,23 @@ pub(crate) fn create_env_for_mcp_server(
     extra_env: Option<HashMap<OsString, OsString>>,
     env_vars: &[McpServerEnvVar],
 ) -> Result<HashMap<OsString, OsString>> {
+    create_env_for_mcp_server_with_lookup(extra_env, env_vars, |name| env::var_os(name))
+}
+
+fn create_env_for_mcp_server_with_lookup(
+    extra_env: Option<HashMap<OsString, OsString>>,
+    env_vars: &[McpServerEnvVar],
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Result<HashMap<OsString, OsString>> {
     let additional_env_vars = local_stdio_env_var_names(env_vars)?;
     let mut env: HashMap<OsString, OsString> = DEFAULT_ENV_VARS
         .iter()
         .copied()
         .chain(additional_env_vars)
-        .filter_map(|var| env::var_os(var).map(|value| (OsString::from(var), value)))
+        .filter_map(|var| lookup(var).map(|value| (OsString::from(var), value)))
         .collect();
     for name in CUSTOM_CA_ENV_KEYS {
-        let Some(value) = env::var_os(name) else {
+        let Some(value) = lookup(name) else {
             continue;
         };
         if value.is_empty() {
@@ -172,6 +180,15 @@ pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
     "TERM",
     "TMPDIR",
     "TZ",
+    // Android local MCP children need the parent's Termux execution policy and
+    // preload hooks. Preserve values only when set; omit PROC_SELF_EXE by default,
+    // which describes the parent rather than the child being launched.
+    #[cfg(target_os = "android")]
+    "LD_PRELOAD",
+    #[cfg(target_os = "android")]
+    "TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE",
+    #[cfg(target_os = "android")]
+    "TERMUX_EXEC__EXECVE_CALL__INTERCEPT",
 ];
 
 #[cfg(windows)]
@@ -216,6 +233,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn local_mcp_preserves_only_platform_runtime_defaults() {
+        let runtime = HashMap::from([
+            (
+                OsString::from("LD_PRELOAD"),
+                OsString::from("/termux/lib/exec.so"),
+            ),
+            (
+                OsString::from("TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE"),
+                OsString::from("disable"),
+            ),
+            (
+                OsString::from("TERMUX_EXEC__EXECVE_CALL__INTERCEPT"),
+                OsString::from("enable"),
+            ),
+        ]);
+        let mut parent = runtime.clone();
+        parent.insert(
+            OsString::from("TERMUX_EXEC__PROC_SELF_EXE"),
+            OsString::from("/parent/codex"),
+        );
+        parent.insert(
+            OsString::from("UNRELATED_SECRET"),
+            OsString::from("not-inherited"),
+        );
+        let actual = create_env_for_mcp_server_with_lookup(None, &[], |name| {
+            parent.get(OsStr::new(name)).cloned()
+        })
+        .expect("local MCP env should build");
+        let expected = if cfg!(target_os = "android") {
+            runtime
+        } else {
+            HashMap::new()
+        };
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn local_mcp_does_not_invent_runtime_settings() {
+        let actual = create_env_for_mcp_server_with_lookup(None, &[], |_| None)
+            .expect("local MCP env should build");
+        assert_eq!(actual, HashMap::new());
+    }
+
+    #[test]
+    fn local_mcp_runtime_overrides_win_including_empty_preload() {
+        let overrides = HashMap::from([
+            (OsString::from("LD_PRELOAD"), OsString::new()),
+            (
+                OsString::from("TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE"),
+                OsString::from("force"),
+            ),
+        ]);
+        let actual =
+            create_env_for_mcp_server_with_lookup(
+                Some(overrides.clone()),
+                &[],
+                |name| match name {
+                    "LD_PRELOAD" => Some(OsString::from("/termux/lib/exec.so")),
+                    "TERMUX_EXEC__SYSTEM_LINKER_EXEC__MODE" => Some(OsString::from("disable")),
+                    _ => None,
+                },
+            )
+            .expect("local MCP env should build");
+        assert_eq!(actual, overrides);
     }
 
     #[tokio::test]
