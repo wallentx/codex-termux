@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Install a Termux Codex package from an Actions artifact or local archive."""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import zipfile
+from pathlib import Path
+
+ARCHIVE_NAMES = (
+    "codex-aarch64-linux-android.tar.gz",
+    "codex-package-aarch64-linux-android.tar.gz",
+)
+
+
+def install(archive_path, download_dir, target):
+    download_dir.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
+        scratch = Path(scratch)
+        extracted = scratch / "extracted"
+        extracted.mkdir()
+        if zipfile.is_zipfile(archive_path):
+            with zipfile.ZipFile(archive_path) as artifact:
+                members = artifact.namelist()
+                selected = []
+                for name in ARCHIVE_NAMES:
+                    selected = [
+                        member for member in members if Path(member).name == name
+                    ]
+                    if selected:
+                        break
+                if len(selected) > 1:
+                    raise ValueError(
+                        "Artifact contains multiple Codex package archives"
+                    )
+                if selected:
+                    archive_path = scratch / "package.tar.gz"
+                    with (
+                        artifact.open(selected[0]) as source,
+                        archive_path.open("wb") as output,
+                    ):
+                        shutil.copyfileobj(source, output)
+                else:
+                    # Preserve support for older Actions artifacts containing raw binaries.
+                    for binary, names in (
+                        ("codex", ("codex.zst", "codex-aarch64-linux-android.zst")),
+                        ("codex-code-mode-host", ("codex-code-mode-host.zst",)),
+                    ):
+                        matches = [
+                            member for member in members if Path(member).name in names
+                        ]
+                        if len(matches) > 1 or (binary == "codex" and not matches):
+                            raise ValueError(f"Artifact has no unique {binary} binary")
+                        if matches:
+                            compressed = scratch / f"{binary}.zst"
+                            with (
+                                artifact.open(matches[0]) as source,
+                                compressed.open("wb") as output,
+                            ):
+                                shutil.copyfileobj(source, output)
+                            with (extracted / binary).open("wb") as output:
+                                subprocess.run(
+                                    ["unzstd", "-c", str(compressed)],
+                                    stdout=output,
+                                    check=True,
+                                )
+                            (extracted / binary).chmod(0o755)
+                    archive_path = None
+        if archive_path is not None:
+            with tarfile.open(archive_path, "r:gz") as archive:
+                for member in archive:
+                    if member.issym() or member.islnk():
+                        raise ValueError(
+                            "Codex archive must contain regular files, not links"
+                        )
+                    archive.extract(member, extracted, filter="data")
+
+        manifest = extracted / "codex-package.json"
+        if manifest.is_file():
+            metadata = json.loads(manifest.read_text())
+            expected = {
+                "layoutVersion": 1,
+                "target": "aarch64-linux-android",
+                "variant": "codex",
+                "entrypoint": "bin/codex",
+                "resourcesDir": "codex-resources",
+                "pathDir": "codex-path",
+            }
+            if {key: metadata.get(key) for key in expected} != expected:
+                raise ValueError("Invalid Android Codex package metadata")
+            version = metadata.get("version", "")
+            if not isinstance(version, str) or not re.fullmatch(
+                r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?", version
+            ):
+                raise ValueError("Invalid Codex package version")
+            for name in ("bin/codex", "bin/codex-code-mode-host"):
+                if not (extracted / name).is_file() or not os.access(
+                    extracted / name, os.X_OK
+                ):
+                    raise ValueError(f"Missing executable: {name}")
+            packages = download_dir / "packages"
+            packages.mkdir(exist_ok=True)
+            package = packages / f"{version}-{os.urandom(8).hex()}"
+            with tempfile.TemporaryDirectory(dir=packages) as stage:
+                staged_package = Path(stage) / "package"
+                shutil.copytree(extracted, staged_package)
+                os.rename(staged_package, package)
+            with tempfile.TemporaryDirectory(dir=target.parent) as stage:
+                launcher = Path(stage) / "codex"
+                launcher.symlink_to((package / "bin/codex").resolve())
+                if target.is_file() and not target.is_symlink():
+                    with tempfile.NamedTemporaryFile(
+                        prefix="previous-codex-", dir=download_dir, delete=False
+                    ) as backup:
+                        shutil.copy2(target, backup.name)
+                os.replace(launcher, target)
+        else:
+            # Legacy flat archives keep their original installation behavior.
+            codex = extracted / "codex"
+            if not codex.is_file():
+                codex = extracted / "codex-aarch64-linux-android"
+            if not codex.is_file():
+                raise ValueError("Archive has no Codex executable")
+            with tempfile.TemporaryDirectory(dir=target.parent) as stage:
+                for binary in ("codex-code-mode-host", "codex"):
+                    source = extracted / binary if binary != "codex" else codex
+                    if source.is_file():
+                        staged = Path(stage) / binary
+                        shutil.copy2(source, staged)
+                        staged.chmod(0o755)
+                        os.replace(
+                            staged,
+                            target if binary == "codex" else target.parent / binary,
+                        )
+    return target
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "-d",
+        type=Path,
+        default=Path.home() / ".local/bin/codex-github",
+        dest="download_dir",
+    )
+    parser.add_argument(
+        "-o", type=Path, default=Path.home() / "bin/codex", dest="target"
+    )
+    parser.add_argument(
+        "input", help="Actions artifact URL, local .zip, or local .tar.gz"
+    )
+    args = parser.parse_args()
+    archive = Path(args.input)
+    if not archive.is_file():
+        match = re.fullmatch(
+            r"https://github\.com/([^/]+)/([^/]+)/(?:suites/\d+|actions/runs/\d+)/artifacts/(\d+)",
+            args.input,
+        )
+        if not match:
+            parser.error(
+                "Expected an Actions artifact URL or an existing local archive"
+            )
+        owner, repo, artifact_id = match.groups()
+        args.download_dir.mkdir(parents=True, exist_ok=True)
+        archive = args.download_dir / f"artifact-{artifact_id}.zip"
+        with archive.open("wb") as output:
+            subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip",
+                ],
+                stdout=output,
+                check=True,
+            )
+    try:
+        install(archive, args.download_dir, args.target)
+    except (
+        ValueError,
+        OSError,
+        tarfile.TarError,
+        zipfile.BadZipFile,
+        subprocess.CalledProcessError,
+    ) as error:
+        parser.exit(1, f"{error}\n")
+    print(f"Installed Codex at {args.target}; Android uses rg from PATH.")
+
+
+if __name__ == "__main__":
+    main()
